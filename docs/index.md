@@ -10,7 +10,7 @@ _A BBOT scan in real-time - visualization with [VivaGraphJS](https://github.com/
 
     Only **Linux** is supported at this time. **Windows** and **macOS** are *not* supported. If you use one of these platforms, consider using [Docker](#Docker).
 
-BBOT offers multiple methods of installation, including **pipx** and **Docker**. If you plan to dev on BBOT, see [Installation (Poetry)](./contribution/#installation-poetry).
+BBOT offers multiple methods of installation, including **pipx** and **Docker**. If you're looking to tinker or write your own module, see [Setting up a Dev Environment](./dev/dev_environment.md).
 
 ### [Python (pip / pipx)](https://pypi.org/project/bbot/)
 
@@ -34,6 +34,8 @@ bbot --help
 
 Docker images are provided, along with helper script `bbot-docker.sh` to persist your scan data.
 
+Scans are output to `~/.bbot/scans` (the usual place for BBOT scan data).
+
 ```bash
 # bleeding edge (dev)
 docker run -it blacklanternsecurity/bbot --help
@@ -44,6 +46,16 @@ docker run -it blacklanternsecurity/bbot:stable --help
 # helper script
 git clone https://github.com/blacklanternsecurity/bbot && cd bbot
 ./bbot-docker.sh --help
+```
+
+Note: If you need to pass in a custom preset, you can do so by mapping the preset into the container:
+
+```bash
+# use the preset `my_preset.yml` from the current directory
+docker run --rm -it \
+  -v "$HOME/.bbot/scans:/root/.bbot/scans" \
+  -v "$PWD/my_preset.yml:/my_preset.yml" \
+  blacklanternsecurity/bbot -p /my_preset.yml
 ```
 
 ## Example Commands

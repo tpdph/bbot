@@ -17,6 +17,8 @@ class ffuf(BaseModule):
         "lines": 5000,
         "max_depth": 0,
         "extensions": "",
+        "ignore_case": False,
+        "rate": 0,
     }
 
     options_desc = {
@@ -24,11 +26,13 @@ class ffuf(BaseModule):
         "lines": "take only the first N lines from the wordlist when finding directories",
         "max_depth": "the maximum directory depth to attempt to solve",
         "extensions": "Optionally include a list of extensions to extend the keyword with (comma separated)",
+        "ignore_case": "Only put lowercase words into the wordlist",
+        "rate": "Rate of requests per second (default: 0)",
     }
 
     deps_common = ["ffuf"]
 
-    banned_characters = set([" "])
+    banned_characters = {" "}
     blacklist = ["images", "css", "image"]
 
     in_scope_only = True
@@ -41,6 +45,7 @@ class ffuf(BaseModule):
         self.wordlist = await self.helpers.wordlist(wordlist_url)
         self.wordlist_lines = self.generate_wordlist(self.wordlist)
         self.tempfile, tempfile_len = self.generate_templist()
+        self.rate = self.config.get("rate", 0)
         self.verbose(f"Generated dynamic wordlist with length [{str(tempfile_len)}]")
         try:
             self.extensions = self.helpers.chain_lists(self.config.get("extensions", ""), validate=True)
@@ -52,7 +57,7 @@ class ffuf(BaseModule):
 
     async def handle_event(self, event):
         if self.helpers.url_depth(event.data) > self.config.get("max_depth"):
-            self.debug(f"Exceeded max depth, aborting event")
+            self.debug("Exceeded max depth, aborting event")
             return
 
         # only FFUF against a directory
@@ -122,7 +127,7 @@ class ffuf(BaseModule):
                 continue
 
             # if the codes are different, we should abort, this should also be a warning, as it is highly unusual behavior
-            if len(set(d["status"] for d in canary_results)) != 1:
+            if len({d["status"] for d in canary_results}) != 1:
                 self.warning("Got different codes for each baseline. This could indicate load balancing")
                 filters[ext] = ["ABORT", "BASELINE_CHANGED_CODES"]
                 continue
@@ -148,7 +153,7 @@ class ffuf(BaseModule):
                 continue
 
             # we start by seeing if all of the baselines have the same character count
-            if len(set(d["length"] for d in canary_results)) == 1:
+            if len({d["length"] for d in canary_results}) == 1:
                 self.debug("All baseline results had the same char count, we can make a filter on that")
                 filters[ext] = [
                     "-fc",
@@ -161,7 +166,7 @@ class ffuf(BaseModule):
                 continue
 
             # if that doesn't work we can try words
-            if len(set(d["words"] for d in canary_results)) == 1:
+            if len({d["words"] for d in canary_results}) == 1:
                 self.debug("All baseline results had the same word count, we can make a filter on that")
                 filters[ext] = [
                     "-fc",
@@ -174,7 +179,7 @@ class ffuf(BaseModule):
                 continue
 
             # as a last resort we will try lines
-            if len(set(d["lines"] for d in canary_results)) == 1:
+            if len({d["lines"] for d in canary_results}) == 1:
                 self.debug("All baseline results had the same word count, we can make a filter on that")
                 filters[ext] = [
                     "-fc",
@@ -243,6 +248,9 @@ class ffuf(BaseModule):
                 self.debug("invalid mode specified, aborting")
                 return
 
+            if self.rate > 0:
+                command += ["-rate", f"{self.rate}"]
+
             if self.proxy:
                 command += ["-x", self.proxy]
 
@@ -252,7 +260,7 @@ class ffuf(BaseModule):
                         self.warning(f"Exiting from FFUF run early, received an ABORT filter: [{filters[ext][1]}]")
                         continue
 
-                    elif filters[ext] == None:
+                    elif filters[ext] is None:
                         pass
 
                     else:
@@ -282,7 +290,7 @@ class ffuf(BaseModule):
                         else:
                             if mode == "normal":
                                 # before emitting, we are going to send another baseline. This will immediately catch things like a WAF flipping blocking on us mid-scan
-                                if baseline == False:
+                                if baseline is False:
                                     pre_emit_temp_canary = [
                                         f
                                         async for f in self.execute_ffuf(
@@ -301,11 +309,12 @@ class ffuf(BaseModule):
                                     ]
                                     if len(pre_emit_temp_canary) == 0:
                                         yield found_json
+
                                     else:
-                                        self.warning(
-                                            "Baseline changed mid-scan. This is probably due to a WAF turning on a block against you."
+                                        self.verbose(
+                                            f"Would have reported URL [{found_json['url']}], but baseline check failed. This could be due to a WAF turning on mid-scan, or an unusual web server configuration."
                                         )
-                                        self.warning(f"Aborting the current run against [{url}]")
+                                        self.verbose(f"Aborting the current run against [{url}]")
                                         return
 
                             yield found_json
@@ -328,7 +337,8 @@ class ffuf(BaseModule):
         return self.helpers.tempfile(virtual_file, pipe=False), len(virtual_file)
 
     def generate_wordlist(self, wordlist_file):
-        wordlist = []
+        wordlist_set = set()  # Use a set to avoid duplicates
+        ignore_case = self.config.get("ignore_case", False)  # Get the ignore_case option
         for line in self.helpers.read_file(wordlist_file):
             line = line.strip()
             if not line:
@@ -339,5 +349,7 @@ class ffuf(BaseModule):
             if any(x in line for x in self.banned_characters):
                 self.debug(f"Skipping adding [{line}] to wordlist because it has a banned character")
                 continue
-            wordlist.append(line)
-        return wordlist
+            if ignore_case:
+                line = line.lower()  # Convert to lowercase if ignore_case is enabled
+            wordlist_set.add(line)  # Add to set to handle duplicates
+        return list(wordlist_set)  # Convert set back to list before returning

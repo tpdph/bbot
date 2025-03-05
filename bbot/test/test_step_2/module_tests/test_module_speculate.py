@@ -24,7 +24,7 @@ class TestSpeculate_Subdirectories(ModuleTestBase):
 
 class TestSpeculate_OpenPorts(ModuleTestBase):
     targets = ["evilcorp.com"]
-    modules_overrides = ["speculate", "certspotter", "internetdb"]
+    modules_overrides = ["speculate", "certspotter", "shodan_idb"]
     config_overrides = {"speculate": True}
 
     async def setup_before_prep(self, module_test):
@@ -62,10 +62,8 @@ class TestSpeculate_OpenPorts(ModuleTestBase):
         for e in module_test.scan.modules["dummy"].events:
             events_data.add(e.data)
         assert all(
-            [
-                x in events_data
-                for x in ("evilcorp.com:80", "evilcorp.com:443", "asdf.evilcorp.com:80", "asdf.evilcorp.com:443")
-            ]
+            x in events_data
+            for x in ("evilcorp.com:80", "evilcorp.com:443", "asdf.evilcorp.com:80", "asdf.evilcorp.com:443")
         )
 
 
@@ -79,8 +77,6 @@ class TestSpeculate_OpenPorts_Portscanner(TestSpeculate_OpenPorts):
         for e in module_test.scan.modules["dummy"].events:
             events_data.add(e.data)
         assert not any(
-            [
-                x in events_data
-                for x in ("evilcorp.com:80", "evilcorp.com:443", "asdf.evilcorp.com:80", "asdf.evilcorp.com:443")
-            ]
+            x in events_data
+            for x in ("evilcorp.com:80", "evilcorp.com:443", "asdf.evilcorp.com:80", "asdf.evilcorp.com:443")
         )

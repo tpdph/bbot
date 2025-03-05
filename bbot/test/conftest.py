@@ -8,6 +8,8 @@ from pathlib import Path
 from contextlib import suppress
 from omegaconf import OmegaConf
 from pytest_httpserver import HTTPServer
+import time
+import queue
 
 from bbot.core import CORE
 from bbot.core.helpers.misc import execute_sync_or_async
@@ -16,7 +18,6 @@ from bbot.core.helpers.interactsh import server_list as interactsh_servers
 # silence stdout + trace
 root_logger = logging.getLogger()
 pytest_debug_file = Path(__file__).parent.parent.parent / "pytest_debug.log"
-print(f"pytest_debug_file: {pytest_debug_file}")
 debug_handler = logging.FileHandler(pytest_debug_file)
 debug_handler.setLevel(logging.DEBUG)
 debug_format = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(filename)s:%(lineno)s %(message)s")
@@ -54,6 +55,12 @@ def silence_live_logging():
             handler.setLevel(logging.CRITICAL)
 
 
+def stop_server(server):
+    server.stop()
+    while server.is_running():
+        time.sleep(0.1)  # Wait a bit before checking again
+
+
 @pytest.fixture
 def bbot_httpserver():
     server = HTTPServer(host="127.0.0.1", port=8888, threaded=True)
@@ -62,11 +69,7 @@ def bbot_httpserver():
     yield server
 
     server.clear()
-    if server.is_running():
-        server.stop()
-
-    # this is to check if the client has made any request where no
-    # `assert_request` was called on it from the test
+    stop_server(server)  # Ensure the server is fully stopped
 
     server.check_assertions()
     server.clear()
@@ -85,19 +88,27 @@ def bbot_httpserver_ssl():
     yield server
 
     server.clear()
-    if server.is_running():
-        server.stop()
-
-    # this is to check if the client has made any request where no
-    # `assert_request` was called on it from the test
+    stop_server(server)  # Ensure the server is fully stopped
 
     server.check_assertions()
     server.clear()
 
 
-@pytest.fixture
-def non_mocked_hosts() -> list:
-    return ["127.0.0.1", "localhost", "raw.githubusercontent.com"] + interactsh_servers
+def should_mock(request):
+    return request.url.host not in ["127.0.0.1", "localhost", "raw.githubusercontent.com"] + interactsh_servers
+
+
+def pytest_collection_modifyitems(config, items):
+    # make sure all tests have the httpx_mock marker
+    for item in items:
+        item.add_marker(
+            pytest.mark.httpx_mock(
+                should_mock=should_mock,
+                assert_all_requests_were_expected=False,
+                assert_all_responses_were_requested=False,
+                can_send_already_matched_responses=True,
+            )
+        )
 
 
 @pytest.fixture
@@ -118,7 +129,7 @@ class Interactsh_mock:
     def __init__(self, name):
         self.name = name
         self.log = logging.getLogger(f"bbot.interactsh.{self.name}")
-        self.interactions = []
+        self.interactions = asyncio.Queue()  # Use an asyncio queue for async access
         self.correlation_id = "deadbeef-dead-beef-dead-beefdeadbeef"
         self.stop = False
         self.poll_task = None
@@ -127,7 +138,7 @@ class Interactsh_mock:
         self.log.info(f"Mocking interaction to subdomain tag: {subdomain_tag}")
         if msg is not None:
             self.log.info(msg)
-        self.interactions.append(subdomain_tag)
+        self.interactions.put_nowait(subdomain_tag)  # Add to the thread-safe queue
 
     async def register(self, callback=None):
         if callable(callback):
@@ -135,27 +146,32 @@ class Interactsh_mock:
         return "fakedomain.fakeinteractsh.com"
 
     async def deregister(self, callback=None):
+        await asyncio.sleep(1)
         self.stop = True
         if self.poll_task is not None:
             self.poll_task.cancel()
-            with suppress(BaseException):
+            with suppress(asyncio.CancelledError):
                 await self.poll_task
 
     async def poll_loop(self, callback=None):
         while not self.stop:
             data_list = await self.poll(callback)
             if not data_list:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
+        await asyncio.sleep(1)
+        await self.poll(callback)
 
     async def poll(self, callback=None):
         poll_results = []
-        for subdomain_tag in self.interactions:
-            result = {"full-id": f"{subdomain_tag}.fakedomain.fakeinteractsh.com", "protocol": "HTTP"}
-            poll_results.append(result)
-            if callback is not None:
-                await execute_sync_or_async(callback, result)
-        self.interactions = []
+        while not self.interactions.empty():
+            subdomain_tag = await self.interactions.get()  # Get the first element from the asyncio queue
+            for protocol in ["HTTP", "DNS"]:
+                result = {"full-id": f"{subdomain_tag}.fakedomain.fakeinteractsh.com", "protocol": protocol}
+                poll_results.append(result)
+                if callback is not None:
+                    await execute_sync_or_async(callback, result)
+            await asyncio.sleep(0.1)
         return poll_results
 
 
@@ -240,80 +256,80 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):  # pragma: no
 
 
 # BELOW: debugging for frozen/hung tests
-# import psutil
-# import traceback
-# import inspect
+import psutil
+import traceback
+import inspect
 
 
-# def _print_detailed_info():  # pragma: no cover
-#     """
-#     Debugging pytests hanging
-#     """
-#     print("=== Detailed Thread and Process Information ===\n")
-#     try:
-#         print("=== Threads ===")
-#         for thread in threading.enumerate():
-#             print(f"Thread Name: {thread.name}")
-#             print(f"Thread ID: {thread.ident}")
-#             print(f"Is Alive: {thread.is_alive()}")
-#             print(f"Daemon: {thread.daemon}")
+def _print_detailed_info():  # pragma: no cover
+    """
+    Debugging pytests hanging
+    """
+    print("=== Detailed Thread and Process Information ===\n")
+    try:
+        print("=== Threads ===")
+        for thread in threading.enumerate():
+            print(f"Thread Name: {thread.name}")
+            print(f"Thread ID: {thread.ident}")
+            print(f"Is Alive: {thread.is_alive()}")
+            print(f"Daemon: {thread.daemon}")
 
-#             if hasattr(thread, "_target"):
-#                 target = thread._target
-#                 if target:
-#                     qualname = (
-#                         f"{target.__module__}.{target.__qualname__}"
-#                         if hasattr(target, "__qualname__")
-#                         else str(target)
-#                     )
-#                     print(f"Target Function: {qualname}")
+            if hasattr(thread, "_target"):
+                target = thread._target
+                if target:
+                    qualname = (
+                        f"{target.__module__}.{target.__qualname__}"
+                        if hasattr(target, "__qualname__")
+                        else str(target)
+                    )
+                    print(f"Target Function: {qualname}")
 
-#                     if hasattr(thread, "_args"):
-#                         args = thread._args
-#                         kwargs = thread._kwargs if hasattr(thread, "_kwargs") else {}
-#                         arg_spec = inspect.getfullargspec(target)
+                    if hasattr(thread, "_args"):
+                        args = thread._args
+                        kwargs = thread._kwargs if hasattr(thread, "_kwargs") else {}
+                        arg_spec = inspect.getfullargspec(target)
 
-#                         all_args = list(args) + [f"{k}={v}" for k, v in kwargs.items()]
+                        all_args = list(args) + [f"{k}={v}" for k, v in kwargs.items()]
 
-#                         if inspect.ismethod(target) and arg_spec.args[0] == "self":
-#                             arg_spec.args.pop(0)
+                        if inspect.ismethod(target) and arg_spec.args[0] == "self":
+                            arg_spec.args.pop(0)
 
-#                         named_args = list(zip(arg_spec.args, all_args))
-#                         if arg_spec.varargs:
-#                             named_args.extend((f"*{arg_spec.varargs}", arg) for arg in all_args[len(arg_spec.args) :])
+                        named_args = list(zip(arg_spec.args, all_args))
+                        if arg_spec.varargs:
+                            named_args.extend((f"*{arg_spec.varargs}", arg) for arg in all_args[len(arg_spec.args) :])
 
-#                         print("Arguments:")
-#                         for name, value in named_args:
-#                             print(f"  {name}: {value}")
-#                 else:
-#                     print("Target Function: None")
-#             else:
-#                 print("Target Function: Unknown")
+                        print("Arguments:")
+                        for name, value in named_args:
+                            print(f"  {name}: {value}")
+                else:
+                    print("Target Function: None")
+            else:
+                print("Target Function: Unknown")
 
-#             print()
+            print()
 
-#         print("=== Processes ===")
-#         current_process = psutil.Process()
-#         for child in current_process.children(recursive=True):
-#             print(f"Process ID: {child.pid}")
-#             print(f"Name: {child.name()}")
-#             print(f"Status: {child.status()}")
-#             print(f"CPU Times: {child.cpu_times()}")
-#             print(f"Memory Info: {child.memory_info()}")
-#             print()
+        print("=== Processes ===")
+        current_process = psutil.Process()
+        for child in current_process.children(recursive=True):
+            print(f"Process ID: {child.pid}")
+            print(f"Name: {child.name()}")
+            print(f"Status: {child.status()}")
+            print(f"CPU Times: {child.cpu_times()}")
+            print(f"Memory Info: {child.memory_info()}")
+            print()
 
-#         print("=== Current Process ===")
-#         print(f"Process ID: {current_process.pid}")
-#         print(f"Name: {current_process.name()}")
-#         print(f"Status: {current_process.status()}")
-#         print(f"CPU Times: {current_process.cpu_times()}")
-#         print(f"Memory Info: {current_process.memory_info()}")
-#         print()
+        print("=== Current Process ===")
+        print(f"Process ID: {current_process.pid}")
+        print(f"Name: {current_process.name()}")
+        print(f"Status: {current_process.status()}")
+        print(f"CPU Times: {current_process.cpu_times()}")
+        print(f"Memory Info: {current_process.memory_info()}")
+        print()
 
-#     except Exception as e:
-#         print(f"An error occurred: {str(e)}")
-#         print("Traceback:")
-#         traceback.print_exc()
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        print("Traceback:")
+        traceback.print_exc()
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
@@ -331,11 +347,11 @@ def pytest_sessionfinish(session, exitstatus):
     yield
 
     # temporarily suspend stdout capture and print detailed thread info
-    # capmanager = session.config.pluginmanager.get_plugin("capturemanager")
-    # if capmanager:
-    #     capmanager.suspend_global_capture(in_=True)
+    capmanager = session.config.pluginmanager.get_plugin("capturemanager")
+    if capmanager:
+        capmanager.suspend_global_capture(in_=True)
 
-    # _print_detailed_info()
+    _print_detailed_info()
 
-    # if capmanager:
-    #     capmanager.resume_global_capture()
+    if capmanager:
+        capmanager.resume_global_capture()

@@ -1,9 +1,10 @@
 import json
+from functools import partial
 from bbot.modules.base import BaseModule
 
 
 class trufflehog(BaseModule):
-    watched_events = ["CODE_REPOSITORY", "FILESYSTEM"]
+    watched_events = ["CODE_REPOSITORY", "FILESYSTEM", "HTTP_RESPONSE", "RAW_TEXT"]
     produced_events = ["FINDING", "VULNERABILITY"]
     flags = ["passive", "safe", "code-enum"]
     meta = {
@@ -13,7 +14,7 @@ class trufflehog(BaseModule):
     }
 
     options = {
-        "version": "3.83.7",
+        "version": "3.88.13",
         "config": "",
         "only_verified": True,
         "concurrency": 8,
@@ -51,7 +52,7 @@ class trufflehog(BaseModule):
         self.github_token = ""
         if self.deleted_forks:
             self.warning(
-                f"Deleted forks is enabled. Scanning for deleted forks is slooooooowwwww. For a smaller repository, this process can take 20 minutes. For a larger repository, it could take hours."
+                "Deleted forks is enabled. Scanning for deleted forks is slooooooowwwww. For a smaller repository, this process can take 20 minutes. For a larger repository, it could take hours."
             )
             for module_name in ("github", "github_codesearch", "github_org", "git_clone"):
                 module_config = self.scan.config.get("modules", {}).get(module_name, {})
@@ -76,17 +77,20 @@ class trufflehog(BaseModule):
             else:
                 return False, "Deleted forks is not enabled"
         else:
-            if "parsed-folder" in event.tags:
-                return False, "Not accepting parsed-folder events"
+            if "unarchived-folder" in event.tags:
+                return False, "Not accepting unarchived-folder events"
         return True
 
     async def handle_event(self, event):
-        description = event.data.get("description", "")
+        description = ""
+        if isinstance(event.data, dict):
+            description = event.data.get("description", "")
+
         if event.type == "CODE_REPOSITORY":
             path = event.data["url"]
             if "git" in event.tags:
                 module = "github-experimental"
-        else:
+        elif event.type == "FILESYSTEM":
             path = event.data["path"]
             if "git" in event.tags:
                 module = "git"
@@ -96,6 +100,14 @@ class trufflehog(BaseModule):
                 module = "postman"
             else:
                 module = "filesystem"
+        elif event.type in ("HTTP_RESPONSE", "RAW_TEXT"):
+            module = "filesystem"
+            file_data = event.raw_response if event.type == "HTTP_RESPONSE" else event.data
+            # write the response to a tempfile
+            # this is necessary because trufflehog doesn't yet support reading from stdin
+            # https://github.com/trufflesecurity/trufflehog/issues/162
+            path = self.helpers.tempfile(file_data, pipe=False)
+
         if event.type == "CODE_REPOSITORY":
             host = event.host
         else:
@@ -108,41 +120,32 @@ class trufflehog(BaseModule):
             verified,
             source_metadata,
         ) in self.execute_trufflehog(module, path):
-            if verified:
-                data = {
-                    "severity": "High",
-                    "description": f"Verified Secret Found. Detector Type: [{detector_name}] Decoder Type: [{decoder_name}] Details: [{source_metadata}]",
-                    "host": host,
-                }
-                if description:
-                    data["description"] += f" Description: [{description}]"
-                data["description"] += f" Raw result: [{raw_result}]"
-                if rawv2_result:
-                    data["description"] += f" RawV2 result: [{rawv2_result}]"
-                await self.emit_event(
-                    data,
-                    "VULNERABILITY",
-                    event,
-                    context=f'{{module}} searched {event.type} using "{module}" method and found verified secret ({{event.type}}): {raw_result}',
-                )
-            else:
-                data = {
-                    "description": f"Potential Secret Found. Detector Type: [{detector_name}] Decoder Type: [{decoder_name}] Details: [{source_metadata}]",
-                    "host": host,
-                }
-                if description:
-                    data["description"] += f" Description: [{description}]"
-                data["description"] += f" Raw result: [{raw_result}]"
-                if rawv2_result:
-                    data["description"] += f" RawV2 result: [{rawv2_result}]"
-                await self.emit_event(
-                    data,
-                    "FINDING",
-                    event,
-                    context=f'{{module}} searched {event.type} using "{module}" method and found possible secret ({{event.type}}): {raw_result}',
-                )
+            verified_str = "Verified" if verified else "Possible"
+            finding_type = "VULNERABILITY" if verified else "FINDING"
+            data = {
+                "description": f"{verified_str} Secret Found. Detector Type: [{detector_name}] Decoder Type: [{decoder_name}] Details: [{source_metadata}]",
+            }
+            if host:
+                data["host"] = host
+            if finding_type == "VULNERABILITY":
+                data["severity"] = "High"
+            if description:
+                data["description"] += f" Description: [{description}]"
+            data["description"] += f" Raw result: [{raw_result}]"
+            if rawv2_result:
+                data["description"] += f" RawV2 result: [{rawv2_result}]"
+            await self.emit_event(
+                data,
+                finding_type,
+                event,
+                context=f'{{module}} searched {event.type} using "{module}" method and found {verified_str.lower()} secret ({{event.type}}): {raw_result}',
+            )
 
-    async def execute_trufflehog(self, module, path):
+        # clean up the tempfile when we're done with it
+        if event.type in ("HTTP_RESPONSE", "RAW_TEXT"):
+            path.unlink(missing_ok=True)
+
+    async def execute_trufflehog(self, module, path=None, string=None):
         command = [
             "trufflehog",
             "--json",
@@ -172,7 +175,7 @@ class trufflehog(BaseModule):
             command.append("--delete-cached-data")
             command.append("--token=" + self.github_token)
 
-        stats_file = self.helpers.tempfile_tail(callback=self.log_trufflehog_status)
+        stats_file = self.helpers.tempfile_tail(callback=partial(self.log_trufflehog_status, path))
         try:
             with open(stats_file, "w") as stats_fh:
                 async for line in self.helpers.run_live(command, stderr=stats_fh):
@@ -198,7 +201,7 @@ class trufflehog(BaseModule):
         finally:
             stats_file.unlink()
 
-    def log_trufflehog_status(self, line):
+    def log_trufflehog_status(self, path, line):
         try:
             line = json.loads(line)
         except Exception:
@@ -207,4 +210,5 @@ class trufflehog(BaseModule):
         message = line.get("msg", "")
         ts = line.get("ts", "")
         status = f"Message: {message} | Timestamp: {ts}"
-        self.info(status)
+        self.verbose(f"Current scan target: {path}")
+        self.verbose(status)
